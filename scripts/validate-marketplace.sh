@@ -1,0 +1,227 @@
+#!/bin/bash
+# Validates that plugin.json is consistent with actual skill/agent files
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+PLUGIN_JSON="$REPO_ROOT/.claude-plugin/plugin.json"
+MARKETPLACE_JSON="$REPO_ROOT/.claude-plugin/marketplace.json"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+errors=0
+warnings=0
+
+echo "Validating marketplace structure..."
+echo ""
+
+# Check JSON syntax
+if ! jq . "$MARKETPLACE_JSON" > /dev/null 2>&1; then
+    echo -e "${RED}ERROR: Invalid JSON syntax in marketplace.json${NC}"
+    exit 1
+fi
+echo -e "${GREEN}marketplace.json syntax: OK${NC}"
+
+if ! jq . "$PLUGIN_JSON" > /dev/null 2>&1; then
+    echo -e "${RED}ERROR: Invalid JSON syntax in plugin.json${NC}"
+    exit 1
+fi
+echo -e "${GREEN}plugin.json syntax: OK${NC}"
+
+# Check the other manifests (Codex, Cursor, Codex marketplace)
+CODEX_JSON="$REPO_ROOT/.codex-plugin/plugin.json"
+CODEX_MARKETPLACE_JSON="$REPO_ROOT/.agents/plugins/marketplace.json"
+CURSOR_JSON="$REPO_ROOT/.cursor-plugin/plugin.json"
+for f in "$CODEX_JSON" "$CODEX_MARKETPLACE_JSON" "$CURSOR_JSON"; do
+    rel="${f#$REPO_ROOT/}"
+    if [ ! -f "$f" ]; then
+        echo -e "${RED}ERROR: Missing manifest: $rel${NC}"
+        exit 1
+    fi
+    if ! jq . "$f" > /dev/null 2>&1; then
+        echo -e "${RED}ERROR: Invalid JSON syntax in $rel${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}$rel syntax: OK${NC}"
+done
+
+# Directory-based manifests must point at ./skills/ so every skill is discovered
+for f in "$CODEX_JSON" "$CURSOR_JSON"; do
+    rel="${f#$REPO_ROOT/}"
+    if [ "$(jq -r '.skills' "$f")" != "./skills/" ]; then
+        echo -e "${RED}ERROR: $rel must set \"skills\": \"./skills/\"${NC}"
+        ((++errors))
+    fi
+done
+
+# Versions must match across all manifests
+expected_version=$(jq -r '.version' "$PLUGIN_JSON")
+for f in "$MARKETPLACE_JSON:.plugins[0].version" "$CODEX_JSON:.version" "$CURSOR_JSON:.version"; do
+    file="${f%%:*}"; query="${f#*:}"
+    v=$(jq -r "$query" "$file")
+    if [ "$v" != "$expected_version" ]; then
+        echo -e "${RED}ERROR: Version mismatch in ${file#$REPO_ROOT/}: $v (expected $expected_version)${NC}"
+        ((++errors))
+    fi
+done
+
+# Check skill references (now folders with SKILL.md)
+echo ""
+echo "Checking skills..."
+while IFS= read -r source; do
+    # Remove leading ./ if present
+    clean_source="${source#./}"
+    file="$REPO_ROOT/${clean_source}/SKILL.md"
+
+    if [ ! -f "$file" ]; then
+        echo -e "${RED}ERROR: Missing SKILL.md for: $source${NC}"
+        echo -e "${RED}       Expected: $file${NC}"
+        ((++errors))
+    else
+        # Extract skill name from SKILL.md frontmatter
+        skill_name=$(grep "^name:" "$file" | head -1 | sed 's/^name: *//')
+        echo -e "${GREEN}OK: $skill_name ($source)${NC}"
+    fi
+done < <(jq -r '.skills[]' "$PLUGIN_JSON")
+
+# Check agent references
+echo ""
+echo "Checking agents..."
+agents_value=$(jq -r '.agents' "$PLUGIN_JSON")
+agents_type=$(jq -r '.agents | type' "$PLUGIN_JSON")
+
+if [ "$agents_type" = "string" ]; then
+    # agents is a directory path
+    clean_dir="${agents_value#./}"
+    agents_dir="$REPO_ROOT/${clean_dir}"
+
+    if [ ! -d "$agents_dir" ]; then
+        echo -e "${RED}ERROR: Missing agents directory: $agents_dir${NC}"
+        ((++errors))
+    else
+        for file in "$agents_dir"/*.md; do
+            if [ -f "$file" ]; then
+                agent_name=$(grep "^name:" "$file" | head -1 | sed 's/^name: *//')
+                echo -e "${GREEN}OK: $agent_name${NC}"
+            fi
+        done
+    fi
+elif [ "$agents_type" = "array" ]; then
+    # agents is an array of paths (with .md extension)
+    while IFS= read -r source; do
+        # Remove leading ./ if present
+        clean_source="${source#./}"
+        file="$REPO_ROOT/${clean_source}"
+
+        if [ ! -f "$file" ]; then
+            echo -e "${RED}ERROR: Missing agent file: $file${NC}"
+            ((++errors))
+        else
+            agent_name=$(grep "^name:" "$file" | head -1 | sed 's/^name: *//')
+            echo -e "${GREEN}OK: $agent_name${NC}"
+        fi
+    done < <(jq -r '.agents[]' "$PLUGIN_JSON")
+fi
+
+# Every skills/*/SKILL.md must exist as a directory (flat layout for npx skills / Copilot / Cursor discovery)
+# and the 'name' frontmatter must match its directory name.
+echo ""
+echo "Checking skill directory names match frontmatter..."
+while IFS= read -r file; do
+    dir_name=$(basename "$(dirname "$file")")
+    skill_name=$(grep -m1 "^name:" "$file" | sed 's/^name: *//' | tr -d '"'"'"'\r')
+    if [ "$dir_name" != "$skill_name" ]; then
+        echo -e "${RED}ERROR: Directory '$dir_name' does not match frontmatter name '$skill_name'${NC}"
+        ((++errors))
+    fi
+done < <(find "$REPO_ROOT/skills" -name "SKILL.md" 2>/dev/null)
+
+# Check for unregistered skills (find all SKILL.md files)
+echo ""
+echo "Checking for unregistered skills..."
+while IFS= read -r file; do
+    # Get the directory containing SKILL.md relative to repo root
+    skill_dir=$(dirname "$file" | sed "s|$REPO_ROOT/||")
+    source="./$skill_dir"
+
+    if ! jq -e --arg src "$source" '.skills[] | select(. == $src)' "$PLUGIN_JSON" > /dev/null 2>&1; then
+        echo -e "${YELLOW}WARNING: Skill not in plugin.json: $source${NC}"
+        ((++warnings))
+    fi
+done < <(find "$REPO_ROOT/skills" -name "SKILL.md" 2>/dev/null)
+
+# Check that sub-documents referenced in SKILL.md files actually exist
+echo ""
+echo "Checking sub-document references..."
+sub_doc_ok=0
+sub_doc_missing=0
+while IFS= read -r skill_file; do
+    skill_dir=$(dirname "$skill_file")
+    # Extract markdown links from the Sub-Documents section: [text](docs/filename.md)
+    if grep -q "## Sub-Documents" "$skill_file" 2>/dev/null; then
+        # Extract all links pointing to docs/
+        while IFS= read -r sub_doc_path; do
+            full_sub_doc="$skill_dir/$sub_doc_path"
+            if [ -f "$full_sub_doc" ]; then
+                sub_doc_ok=$((sub_doc_ok + 1))
+            else
+                skill_name=$(grep "^name:" "$skill_file" | head -1 | sed 's/^name: *//')
+                echo -e "${RED}ERROR: Missing sub-document '$sub_doc_path' referenced in $skill_name${NC}"
+                echo -e "${RED}       Expected: $full_sub_doc${NC}"
+                ((++errors))
+                sub_doc_missing=$((sub_doc_missing + 1))
+            fi
+        done < <(grep -oE '\(docs/[^)]+\.md\)' "$skill_file" | tr -d '()')
+    fi
+done < <(find "$REPO_ROOT/skills" -name "SKILL.md" 2>/dev/null)
+if [ $sub_doc_ok -gt 0 ] || [ $sub_doc_missing -gt 0 ]; then
+    echo -e "${GREEN}Sub-documents: $sub_doc_ok OK, $sub_doc_missing missing${NC}"
+else
+    echo -e "${GREEN}No sub-documents defined${NC}"
+fi
+
+# Check for unregistered agents
+echo ""
+echo "Checking for unregistered agents..."
+if [ "$agents_type" = "string" ]; then
+    # When agents is a directory, all .md files in that directory are automatically included
+    echo -e "${GREEN}Using directory mode: all agents in ${agents_value} are included${NC}"
+elif [ "$agents_type" = "array" ]; then
+    for file in "$REPO_ROOT"/agents/*.md; do
+        if [ -f "$file" ]; then
+            basename=$(basename "$file")
+            source="./agents/$basename"
+            if ! jq -e --arg src "$source" '.agents[] | select(. == $src)' "$PLUGIN_JSON" > /dev/null 2>&1; then
+                echo -e "${YELLOW}WARNING: Agent file not in plugin.json: $basename${NC}"
+                ((++warnings))
+            fi
+        fi
+    done
+fi
+
+# Summary
+echo ""
+echo "=== Summary ==="
+echo "Skills registered: $(jq '.skills | length' "$PLUGIN_JSON")"
+if [ "$agents_type" = "string" ]; then
+    agents_count=$(find "$agents_dir" -name "*.md" 2>/dev/null | wc -l)
+    echo "Agents registered: $agents_count (directory mode: $agents_value)"
+else
+    echo "Agents registered: $(jq '.agents | length' "$PLUGIN_JSON")"
+fi
+echo "Plugin version: $(jq -r '.version' "$PLUGIN_JSON")"
+
+if [ $errors -gt 0 ]; then
+    echo -e "${RED}Errors: $errors${NC}"
+    exit 1
+fi
+
+if [ $warnings -gt 0 ]; then
+    echo -e "${YELLOW}Warnings: $warnings${NC}"
+fi
+
+echo -e "${GREEN}Validation passed!${NC}"
